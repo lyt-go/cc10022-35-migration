@@ -20,16 +20,20 @@ class MergeLogService(BaseModuleService):
 
     def record_merge_event(self, golden_id: str, source_records: list[str],
                             merge_rule: str, winners: list[str],
-                            losers: list[str]) -> dict[str, Any]:
+                            losers: list[str],
+                            lineage_ids: list[int] | None = None) -> dict[str, Any]:
         """合并记录：将重复记录的归并过程写入合并追溯日志。
 
-        记录每条合并操作的优胜字段和淘汰字段对比，
-        写入合并记录到merge_log存储，关联黄金记录ID和来源记录。
+        记录每条合并操作的优胜字段和淘汰字段对比，并登记本次合并实际使用的
+        字段级血缘条目（``lineage_ids``），供合并报表按步骤核对字段变换。
         """
         rows = store.rows(self.MODULE)
-        record_id = f"MERGE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        entry_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+        record_id = (
+            f"MERGE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{entry_id:04d}"
+        )
         entry = {
-            "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+            "id": entry_id,
             "记录编号": record_id,
             "黄金ID": golden_id,
             "来源记录": "|".join(source_records),
@@ -42,10 +46,119 @@ class MergeLogService(BaseModuleService):
             "pending": False,
             "abnormal": False,
             "source_count": len(source_records),
+            "字段血缘关联": [int(i) for i in (lineage_ids or [])],
         }
         rows.append(entry)
         # 写入合并记录到合并追溯存储，关联黄金记录与来源记录
         return {"ok": True, "merge_log": entry}
+
+    def link_lineage_to_merge(self, merge_log_id: int,
+                              lineage_ids: list[int]) -> dict[str, Any]:
+        """把实际参与合并的字段血缘条目挂到合并记录上。"""
+        log_entry = self.get_entry(merge_log_id)
+        if log_entry is None:
+            return {"ok": False, "reason": f"合并记录 {merge_log_id} 不存在"}
+        existing = {int(i) for i in log_entry.get("字段血缘关联", [])}
+        added = [int(i) for i in lineage_ids if int(i) not in existing]
+        log_entry["字段血缘关联"] = sorted(existing | set(added))
+        return {"ok": True, "merge_log_id": merge_log_id,
+                "linked": log_entry["字段血缘关联"], "added": added}
+
+    def merge_lineage_details(self, golden_id: str,
+                              merge_log_id: int | None = None) -> dict[str, Any]:
+        """合并追溯明细：合并记录 + 实际字段血缘步骤 + 解析依据。
+
+        电话走旧拼接链路时仍返回原文与“边界不可证明”的原因；地址走新清洗
+        规则时返回结构化步骤，报表可直接核对地址经过的字段变换。
+        """
+        from app.services.record_lineage import RecordLineageService
+
+        if merge_log_id is not None:
+            merge_row = self.get_entry(merge_log_id)
+        else:
+            history = self.query_merge_history(golden_id)
+            merge_row = history[0] if history else None
+        lineage_svc = RecordLineageService()
+        if merge_row is None:
+            return {
+                "golden_id": golden_id,
+                "合并记录": None,
+                "fields": [],
+                "message": "没有可关联的合并记录",
+            }
+        linked_ids = [int(i) for i in merge_row.get("字段血缘关联", []) if str(i).isdigit()]
+        rows = store.rows("record_lineage")
+        if linked_ids:
+            lineage_rows = [row for row in rows if int(row.get("id", 0)) in linked_ids]
+        else:
+            lineage_rows = [row for row in rows if row.get("黄金ID") == golden_id]
+
+        fields: dict[str, list[dict[str, Any]]] = {}
+        for row in lineage_rows:
+            view = lineage_svc._structured_view(row)
+            if not view.get("可用", True):
+                view = lineage_svc._fallback_view(row)
+            fields.setdefault(row.get("字段路径", ""), []).append({
+                "血缘编号": view.get("血缘编号"),
+                "来源系统": view.get("来源系统"),
+                "来源记录": view.get("来源记录"),
+                "变换格式": view.get("变换格式"),
+                "步骤": view.get("步骤", []),
+                "步骤值": view.get("步骤值", []),
+                "原文": view.get("原文"),
+                "解析状态": view.get("解析状态"),
+                "解析依据": view.get("解析依据"),
+                "证据核验": view.get("证据核验"),
+                "未迁移原因": view.get("未迁移原因"),
+                "可完成合并证据核验": view.get("可完成合并证据核验", False),
+            })
+        return {
+            "golden_id": golden_id,
+            "合并记录": merge_row.get("记录编号"),
+            "来源记录": merge_row.get("来源记录"),
+            "合并规则": merge_row.get("合并规则"),
+            "合并时间": merge_row.get("合并时间"),
+            "fields": [
+                {"字段路径": field, "sources": sources}
+                for field, sources in fields.items()
+            ],
+            "证据核验": lineage_svc.audit_merge_evidence(golden_id),
+        }
+
+    def export_merge_report(self, golden_id: str,
+                            merge_log_id: int | None = None) -> dict[str, Any]:
+        """合并报表导出：按字段给出实际步骤与解析依据，供审计核对。
+
+        电话字段（旧拼接）只输出原文并注明不可核验；地址字段（新格式）输出
+        结构化步骤，便于逐项核对地址经过的字段变换。
+        """
+        details = self.merge_lineage_details(golden_id, merge_log_id)
+        rows_out: list[dict[str, Any]] = []
+        for field_block in details.get("fields", []):
+            field = field_block["字段路径"]
+            for source in field_block["sources"]:
+                rows_out.append({
+                    "字段路径": field,
+                    "来源系统": source.get("来源系统"),
+                    "来源记录": source.get("来源记录"),
+                    "变换格式": source.get("变换格式"),
+                    "步骤": source.get("步骤", []),
+                    "原文": source.get("原文"),
+                    "解析依据": source.get("解析依据"),
+                    "证据核验": source.get("证据核验"),
+                    "可完成合并证据核验": source.get("可完成合并证据核验", False),
+                    "未迁移原因": source.get("未迁移原因"),
+                })
+        audit = details.get("证据核验", {})
+        return {
+            "golden_id": golden_id,
+            "合并记录": details.get("合并记录"),
+            "来源记录": details.get("来源记录"),
+            "字段数": len(details.get("fields", [])),
+            "可核验字段": audit.get("可核验字段", []),
+            "不可核验字段": audit.get("不可核验字段", []),
+            "明细": rows_out,
+        }
 
     def query_merge_history(self, golden_id: str) -> list[dict[str, Any]]:
         """查询指定黄金记录的完整合并追溯历史。

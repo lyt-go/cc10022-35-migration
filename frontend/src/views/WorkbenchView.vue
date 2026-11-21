@@ -86,6 +86,11 @@
       </form>
     </div>
 
+    <LineageAuditPanel
+      v-if="meta.key === 'record_lineage' || meta.key === 'merge_log'"
+      :golden-id="meta.key === 'merge_log' ? mergeGoldenId : undefined"
+    />
+
     <footer class="page-foot">
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -103,6 +108,7 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import LineageAuditPanel from '@/views/LineageAuditPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +121,11 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+// 合并追溯日志里第一行一般就是当前核验对象；血缘页默认用样例双格式黄金ID。
+const mergeGoldenId = computed(() => {
+  const first = rows.value[0]
+  return first ? String(first['黄金ID'] ?? '') : undefined
+})
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
